@@ -1,0 +1,311 @@
+# ═══════════════════════════════════════════════════════════════
+# E-Commerce Data Lakehouse — Docker Compose Configuration
+# ═══════════════════════════════════════════════════════════════
+#
+# Services:
+#   1. minio          — S3-compatible object storage (Data Lake)
+#   2. postgres        — PostgreSQL (Amazon Redshift stand-in)
+#   3. elasticsearch   — Full-text search & log analytics
+#   4. spark-master    — Apache Spark master node
+#   5. spark-worker    — Apache Spark worker node
+#   6. pipeline        — Python ETL orchestrator
+#
+# Usage:
+#   docker-compose up --build
+#   docker-compose down -v   (clean up including volumes)
+# ═══════════════════════════════════════════════════════════════
+
+version: "3.9"
+
+x-common-env: &common-env
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-lakehouse_admin}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-lakehouse_secret_2024}
+  S3_BUCKET_RAW: ${S3_BUCKET_RAW:-ecommerce-raw}
+  S3_BUCKET_CURATED: ${S3_BUCKET_CURATED:-ecommerce-curated}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-ecommerce_warehouse}
+  POSTGRES_USER: ${POSTGRES_USER:-warehouse_admin}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-warehouse_secret_2024}
+  ELASTICSEARCH_HOST: elasticsearch
+  ELASTICSEARCH_PORT: "9200"
+  ELASTICSEARCH_SCHEME: http
+
+services:
+  # ─────────────────────────────────────────────
+  # MinIO — S3-Compatible Object Storage
+  # ─────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: lakehouse-minio
+    hostname: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-lakehouse_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-lakehouse_secret_2024}
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO Console UI
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - lakehouse-net
+
+  # ─────────────────────────────────────────────
+  # MinIO Bucket Initialization
+  # ─────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:RELEASE.2024-01-16T16-06-34Z
+    container_name: lakehouse-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-lakehouse_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-lakehouse_secret_2024}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set lakehouse http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+      mc mb --ignore-existing lakehouse/ecommerce-raw;
+      mc mb --ignore-existing lakehouse/ecommerce-curated;
+      echo 'Buckets created:';
+      mc ls lakehouse/;
+      exit 0;
+      "
+    networks:
+      - lakehouse-net
+
+  # ─────────────────────────────────────────────
+  # PostgreSQL — Data Warehouse (Redshift Stand-in)
+  # ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: lakehouse-postgres
+    hostname: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce_warehouse}
+      POSTGRES_USER: ${POSTGRES_USER:-warehouse_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-warehouse_secret_2024}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c effective_cache_size=768MB
+        -c work_mem=64MB
+        -c maintenance_work_mem=128MB
+        -c max_parallel_workers_per_gather=2
+        -c max_parallel_workers=4
+        -c random_page_cost=1.1
+        -c effective_io_concurrency=200
+        -c wal_level=minimal
+        -c max_wal_senders=0
+        -c synchronous_commit=off
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-warehouse_admin} -d ${POSTGRES_DB:-ecommerce_warehouse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - lakehouse-net
+
+  # ─────────────────────────────────────────────
+  # Elasticsearch — Search & Log Analytics
+  # ─────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.3
+    container_name: lakehouse-elasticsearch
+    hostname: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - cluster.name=ecommerce-lakehouse
+      - node.name=es-node-1
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"   # REST API
+      - "9300:9300"   # Transport
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - lakehouse-net
+
+  # ─────────────────────────────────────────────
+  # Apache Spark — Master Node
+  # ─────────────────────────────────────────────
+  spark-master:
+    image: bitnami/spark:3.5.0
+    container_name: lakehouse-spark-master
+    hostname: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=9090
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "9090:9090"   # Spark Master Web UI (port 9090)
+      - "7077:7077"   # Spark Master Port
+    volumes:
+      - spark_data:/opt/bitnami/spark/work
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9090"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    networks:
+      - lakehouse-net
+
+  # ─────────────────────────────────────────────
+  # Apache Spark — Worker Node
+  # ─────────────────────────────────────────────
+  spark-worker:
+    image: bitnami/spark:3.5.0
+    container_name: lakehouse-spark-worker
+    hostname: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    volumes:
+      - spark_data:/opt/bitnami/spark/work
+    networks:
+      - lakehouse-net
+
+  # ─────────────────────────────────────────────
+  # Data Pipeline — Orchestrator Container
+  # ─────────────────────────────────────────────
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lakehouse-pipeline
+    hostname: pipeline
+    environment:
+      <<: *common-env
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_DRIVER_MEMORY: 1g
+      SPARK_EXECUTOR_MEMORY: 1g
+      NUM_CUSTOMERS: ${NUM_CUSTOMERS:-500}
+      NUM_PRODUCTS: ${NUM_PRODUCTS:-200}
+      NUM_TRANSACTIONS: ${NUM_TRANSACTIONS:-5000}
+      NUM_REVIEWS: ${NUM_REVIEWS:-2000}
+      NUM_CLICKSTREAM_EVENTS: ${NUM_CLICKSTREAM_EVENTS:-10000}
+      GENERATION_SEED: ${GENERATION_SEED:-42}
+      DDL_FILE: /app/warehouse/ddl.sql
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    volumes:
+      - ./data_generator:/app/data_generator
+      - ./etl:/app/etl
+      - ./warehouse:/app/warehouse
+      - ./search:/app/search
+      - ./orchestrator:/app/orchestrator
+      - ./scripts:/app/scripts
+      - ./.env:/app/.env
+    command: >
+      bash -c "
+        echo '═══════════════════════════════════════════════════';
+        echo 'E-Commerce Data Lakehouse — Pipeline Starting';
+        echo '═══════════════════════════════════════════════════';
+
+        echo '';
+        echo '── Step 1/4: Data Generation ──';
+        python -u /app/data_generator/generate_data.py;
+
+        echo '';
+        echo '── Step 2/4: Spark ETL Processing ──';
+        echo '(Submitting PySpark job to Spark cluster...)';
+        pip install -q boto3 pyspark;
+        cd /app/etl && python -u spark_etl.py;
+
+        echo '';
+        echo '── Step 3/4: Warehouse Loading ──';
+        python -u /app/warehouse/load_warehouse.py;
+
+        echo '';
+        echo '── Step 4/4: Elasticsearch Indexing ──';
+        python -u /app/search/index_elasticsearch.py;
+
+        echo '';
+        echo '═══════════════════════════════════════════════════';
+        echo 'Pipeline Complete! All steps executed.';
+        echo '═══════════════════════════════════════════════════';
+        echo '';
+        echo 'Access Points:';
+        echo '  MinIO Console:        http://localhost:9001';
+        echo '  Spark Master UI:      http://localhost:9090';
+        echo '  Elasticsearch:        http://localhost:9200';
+        echo '  PostgreSQL:           localhost:5432';
+        echo '';
+      "
+    networks:
+      - lakehouse-net
+
+# ─────────────────────────────────────────────
+# Named Volumes
+# ─────────────────────────────────────────────
+volumes:
+  minio_data:
+    driver: local
+  postgres_data:
+    driver: local
+  es_data:
+    driver: local
+  spark_data:
+    driver: local
+
+# ─────────────────────────────────────────────
+# Network
+# ─────────────────────────────────────────────
+networks:
+  lakehouse-net:
+    driver: bridge
+    name: ecommerce-lakehouse-network
+

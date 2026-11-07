@@ -1,0 +1,15 @@
+# Elasticsearch configuration for E-Commerce Data Lakehouse
+cluster.name: ecommerce-lakehouse
+node.name: es-node-1
+network.host: 0.0.0.0
+discovery.type: single-node
+xpack.security.enabled: false
+
+# Performance tuning
+indices.memory.index_buffer_size: 20%
+thread_pool.write.queue_size: 1000
+
+# Index defaults
+index.number_of_shards: 1
+index.number_of_replicas: 0
+

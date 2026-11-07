@@ -1,0 +1,38 @@
+# E-Commerce Data Lakehouse
+# Ignore patterns for Docker and Git
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Data (generated at runtime)
+data/
+*.parquet
+*.log
+
+# Environment (keep .env.example, ignore local overrides)
+.env.local
+
